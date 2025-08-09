@@ -2425,6 +2425,18 @@ RAG_OLLAMA_API_KEY = PersistentConfig(
     os.getenv("RAG_OLLAMA_API_KEY", ""),
 )
 
+RAG_BINARY_SEARCH_CANDIDATE_MULTIPLIER = PersistentConfig(
+    "RAG_BINARY_SEARCH_CANDIDATE_MULTIPLIER",
+    "rag.binary_search.candidate_multiplier",
+    int(os.environ.get("RAG_BINARY_SEARCH_CANDIDATE_MULTIPLIER", "10")),
+)
+
+RAG_BINARY_SEARCH_MIN_PERCENTAGE = PersistentConfig(
+    "RAG_BINARY_SEARCH_MIN_PERCENTAGE", 
+    "rag.binary_search.min_percentage",
+    float(os.environ.get("RAG_BINARY_SEARCH_MIN_PERCENTAGE", "0.15")),
+)
+
 
 ENABLE_RAG_LOCAL_WEB_FETCH = (
     os.getenv("ENABLE_RAG_LOCAL_WEB_FETCH", "False").lower() == "true"

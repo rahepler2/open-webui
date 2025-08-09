@@ -12,7 +12,7 @@ from open_webui.models.users import Users, UserResponse
 
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON
+from sqlalchemy import BigInteger, Column, String, Text, JSON, Boolean
 
 from open_webui.utils.access_control import has_access
 
@@ -35,6 +35,8 @@ class Knowledge(Base):
 
     data = Column(JSON, nullable=True)
     meta = Column(JSON, nullable=True)
+
+    is_binary_quantized = Column(Boolean, default=False)
 
     access_control = Column(JSON, nullable=True)  # Controls data access levels.
     # Defines access control rules for this entry.
@@ -69,6 +71,8 @@ class KnowledgeModel(BaseModel):
     data: Optional[dict] = None
     meta: Optional[dict] = None
 
+    is_binary_quantized: Optional[bool] = False
+
     access_control: Optional[dict] = None
 
     created_at: int  # timestamp in epoch
@@ -96,6 +100,7 @@ class KnowledgeForm(BaseModel):
     name: str
     description: str
     data: Optional[dict] = None
+    is_binary_quantized: Optional[bool] = False
     access_control: Optional[dict] = None
 
 

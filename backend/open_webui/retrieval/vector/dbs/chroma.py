@@ -1,9 +1,11 @@
+import numpy as np
 import chromadb
 import logging
 from chromadb import Settings
 from chromadb.utils.batch_utils import create_batches
 
-from typing import Optional
+from typing import Optional, List, Union
+import base64
 
 from open_webui.retrieval.vector.main import (
     VectorDBBase,
@@ -141,10 +143,17 @@ class ChromaClient(VectorDBBase):
             name=collection_name, metadata={"hnsw:space": "cosine"}
         )
 
-        ids = [item["id"] for item in items]
-        documents = [item["text"] for item in items]
-        embeddings = [item["vector"] for item in items]
-        metadatas = [item["metadata"] for item in items]
+        ids = [item.id for item in items]
+        documents = [item.text for item in items]
+        embeddings = [item.vector for item in items]
+        
+        # Handle binary vectors in metadata
+        metadatas = []
+        for item in items:
+            metadata = item.metadata if item.metadata else {}
+            if item.binary_vector:
+                metadata["binary_vector"] = base64.b64encode(item.binary_vector).decode('utf-8')
+            metadatas.append(metadata)
 
         for batch in create_batches(
             api=self.client,
@@ -161,10 +170,17 @@ class ChromaClient(VectorDBBase):
             name=collection_name, metadata={"hnsw:space": "cosine"}
         )
 
-        ids = [item["id"] for item in items]
-        documents = [item["text"] for item in items]
-        embeddings = [item["vector"] for item in items]
-        metadatas = [item["metadata"] for item in items]
+        ids = [item.id for item in items]
+        documents = [item.text for item in items]
+        embeddings = [item.vector for item in items]
+        
+        # Handle binary vectors in metadata
+        metadatas = []
+        for item in items:
+            metadata = item.metadata if item.metadata else {}
+            if item.binary_vector:
+                metadata["binary_vector"] = base64.b64encode(item.binary_vector).decode('utf-8')
+            metadatas.append(metadata)
 
         collection.upsert(
             ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas
@@ -194,3 +210,93 @@ class ChromaClient(VectorDBBase):
     def reset(self):
         # Resets the database. This will delete all collections and item entries.
         return self.client.reset()
+
+    def _compute_hamming_distance(self, binary_vec1: bytes, binary_vec2: bytes) -> int:
+        """Compute Hamming distance using pure numpy."""
+        try:
+            arr1 = np.frombuffer(binary_vec1, dtype=np.uint8)
+            arr2 = np.frombuffer(binary_vec2, dtype=np.uint8)
+            
+            min_len = min(len(arr1), len(arr2))
+            arr1 = arr1[:min_len]
+            arr2 = arr2[:min_len]
+            
+            xor_result = arr1 ^ arr2
+            binary_bits = np.unpackbits(xor_result)
+            return int(np.sum(binary_bits))
+        except Exception as e:
+            log.error(f"Error computing Hamming distance: {e}")
+            return 999999
+
+    def search_binary(self, collection_name: str, binary_vectors: List[bytes], limit: int) -> Optional[SearchResult]:
+        """Search for binary vectors with Hamming distance."""
+        try:
+            collection = self.client.get_collection(name=collection_name)
+            all_results = collection.get(include=["metadatas", "documents"])
+            
+            # Early exit if no binary vectors
+            if not any("binary_vector" in (meta or {}) for meta in all_results["metadatas"]):
+                return SearchResult(ids=[[]], distances=[[]], documents=[[]], metadatas=[[]]) 
+            
+            candidates = []
+            for query_binary in binary_vectors:
+                for i, metadata in enumerate(all_results["metadatas"]):
+                    if metadata and "binary_vector" in metadata:
+                        # Decode base64-stored binary vector
+                        doc_binary = base64.b64decode(metadata["binary_vector"])
+                        
+                        hamming_dist = self._compute_hamming_distance(query_binary, doc_binary)
+                        candidates.append({
+                            "id": all_results["ids"][i],
+                            "document": all_results["documents"][i],
+                            "metadata": metadata,
+                            "distance": hamming_dist,
+                        })
+            
+            candidates.sort(key=lambda x: x["distance"])
+            top_candidates = candidates[:limit]
+            
+            if top_candidates:
+                return SearchResult(
+                    ids=[[c["id"] for c in top_candidates]],
+                    distances=[[c["distance"] for c in top_candidates]],
+                    documents=[[c["document"] for c in top_candidates]],
+                    metadatas=[[c["metadata"] for c in top_candidates]],
+                )
+            return SearchResult(ids=[[]], distances=[[]], documents=[[]], metadatas=[[]]) 
+        except Exception as e:
+            log.error(f"Error in binary search: {e}")
+            return None
+
+    def search_filtered(self, collection_name: str, vectors: List[List[Union[float, int]]], 
+                    limit: int, filtered_ids: List[str]) -> Optional[SearchResult]:
+        """Search for vectors with ID filter."""
+        try:
+            collection = self.client.get_collection(name=collection_name)
+            candidate_results = collection.get(ids=filtered_ids, include=["metadatas", "documents", "embeddings"])
+            
+            if not candidate_results["embeddings"]:
+                return SearchResult(ids=[[]], distances=[[]], documents=[[]], metadatas=[[]]) 
+            
+            query_vector = np.array(vectors[0])
+            candidate_embeddings = np.array(candidate_results["embeddings"])
+            
+            query_norm = query_vector / np.linalg.norm(query_vector)
+            candidate_norms = candidate_embeddings / np.linalg.norm(candidate_embeddings, axis=1, keepdims=True)
+            similarities = np.dot(candidate_norms, query_norm)
+            
+            # Convert similarities to distances to match existing search() format
+            distances = 2 - similarities  # Same transformation as existing search()
+            distances = distances / 2
+            
+            sorted_indices = np.argsort(distances)[:limit]  # Sort by distance (ascending)
+            
+            return SearchResult(
+                ids=[[candidate_results["ids"][i] for i in sorted_indices]],
+                distances=[distances[sorted_indices].tolist()],
+                documents=[[candidate_results["documents"][i] for i in sorted_indices]],
+                metadatas=[[candidate_results["metadatas"][i] for i in sorted_indices]],
+            )
+        except Exception as e:
+            log.error(f"Error in filtered search: {e}")
+            return None

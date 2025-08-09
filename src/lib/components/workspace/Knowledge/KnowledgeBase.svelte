@@ -65,6 +65,7 @@
 			file_ids: string[];
 		};
 		files: any[];
+		is_binary_quantized?: boolean;
 	};
 
 	let id = null;
@@ -457,7 +458,8 @@
 				...knowledge,
 				name: knowledge.name,
 				description: knowledge.description,
-				access_control: knowledge.access_control
+				access_control: knowledge.access_control,
+				is_binary_quantized: knowledge.is_binary_quantized
 			}).catch((e) => {
 				toast.error(`${e}`);
 			});
@@ -726,6 +728,37 @@
 								changeDebounceHandler();
 							}}
 						/>
+					</div>
+
+					<div class="flex items-center justify-between px-1 py-2">
+						<div class="flex items-center gap-2">
+							<span class="text-xs font-medium text-gray-700 dark:text-gray-300">
+								{$i18n.t('Binary Quantization')}
+							</span>
+							{#if knowledge?.is_binary_quantized}
+								<span class="px-2 py-0.5 text-xs bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200 rounded-full">
+									{$i18n.t('Enabled')}
+								</span>
+							{/if}
+						</div>
+						<button
+							type="button"
+							class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 {knowledge?.is_binary_quantized
+								? 'bg-blue-600'
+								: 'bg-gray-200 dark:bg-gray-700'}"
+							on:click={() => {
+								if (knowledge) {
+									knowledge.is_binary_quantized = !knowledge.is_binary_quantized;
+									changeDebounceHandler();
+								}
+							}}
+						>
+							<span
+								class="inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform {knowledge?.is_binary_quantized
+									? 'translate-x-5'
+									: 'translate-x-1'}"
+							></span>
+						</button>
 					</div>
 				</div>
 			</div>

@@ -7,6 +7,7 @@ class VectorItem(BaseModel):
     id: str
     text: str
     vector: List[float | int]
+    binary_vector: Optional[bytes] = None  # Optional binary vector for quantized data
     metadata: Any
 
 
@@ -84,3 +85,13 @@ class VectorDBBase(ABC):
     def reset(self) -> None:
         """Reset the vector database by removing all collections or those matching a condition."""
         pass
+
+    def search_binary(self, collection_name: str, binary_vectors: List[bytes], limit: int) -> Optional[SearchResult]: 
+        """Search for binary vectors with Hamming distnance."""
+        return None 
+    
+    def search_filtered(self, collection_name: str, vectors: List[List[Union[float, int]]], 
+                     limit: int, filtered_ids: List[str]) -> Optional[SearchResult]:
+        """Search only within specified IDs."""
+        return self.search(collection_name, vectors, limit)
+

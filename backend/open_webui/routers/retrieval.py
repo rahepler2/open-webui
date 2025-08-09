@@ -38,6 +38,8 @@ from open_webui.storage.provider import Storage
 
 
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+from open_webui.retrieval.vector.main import VectorItem
+from open_webui.retrieval.utils import compute_binary_vector
 
 # Document loaders
 from open_webui.retrieval.loaders.main import Loader
@@ -1300,15 +1302,32 @@ def save_docs_to_vector_db(
             user=user,
         )
 
-        items = [
-            {
+        # Check if collection uses binary quantization
+        use_binary_quantization = False
+        try:
+            knowledge_base = Knowledges.get_knowledge_by_id(collection_name)
+            use_binary_quantization = knowledge_base and knowledge_base.is_binary_quantized
+        except Exception as e:
+            log.debug(f"Could not check binary quantization for collection {collection_name}: {e}")
+        
+        items = []
+        for idx, text in enumerate(texts):
+            item_data = {
                 "id": str(uuid.uuid4()),
                 "text": text,
                 "vector": embeddings[idx],
                 "metadata": metadatas[idx],
             }
-            for idx, text in enumerate(texts)
-        ]
+            
+            # Add binary vector if quantization is enabled
+            if use_binary_quantization:
+                try:
+                    item_data["binary_vector"] = compute_binary_vector(embeddings[idx])
+                except Exception as e:
+                    log.warning(f"Failed to compute binary vector for item {idx}: {e}")
+                    # Continue without binary vector
+            
+            items.append(VectorItem(**item_data))
 
         VECTOR_DB_CLIENT.insert(
             collection_name=collection_name,

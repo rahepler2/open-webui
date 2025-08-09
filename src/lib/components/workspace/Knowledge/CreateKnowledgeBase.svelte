@@ -14,6 +14,7 @@
 	let name = '';
 	let description = '';
 	let accessControl = {};
+	let isBinaryQuantized = false;
 
 	const submitHandler = async () => {
 		loading = true;
@@ -30,7 +31,8 @@
 			localStorage.token,
 			name,
 			description,
-			accessControl
+			accessControl,
+			isBinaryQuantized
 		).catch((e) => {
 			toast.error(`${e}`);
 		});
@@ -107,6 +109,28 @@
 							required
 						/>
 					</div>
+				</div>
+
+				<div class="flex items-center justify-between py-2">
+					<div>
+						<div class="text-sm font-medium">{$i18n.t('Binary Quantization')}</div>
+						<div class="text-xs text-gray-500 dark:text-gray-400">
+							{$i18n.t('Enable fast vector search with 32x memory reduction')}
+						</div>
+					</div>
+					<button
+						type="button"
+						class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 {isBinaryQuantized
+							? 'bg-blue-600'
+							: 'bg-gray-200 dark:bg-gray-700'}"
+						on:click={() => (isBinaryQuantized = !isBinaryQuantized)}
+					>
+						<span
+							class="inline-block h-4 w-4 transform rounded-full bg-white shadow-lg transition-transform {isBinaryQuantized
+								? 'translate-x-6'
+								: 'translate-x-1'}"
+						></span>
+					</button>
 				</div>
 			</div>
 		</div>

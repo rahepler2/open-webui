@@ -6,6 +6,7 @@ import requests
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import time
+import numpy as np
 
 from urllib.parse import quote
 from huggingface_hub import snapshot_download
@@ -81,6 +82,58 @@ class VectorSearchRetriever(BaseRetriever):
 def query_doc(
     collection_name: str, query_embedding: list[float], k: int, user: UserModel = None
 ):
+    
+    use_binary_quantization = False
+
+    # Check if collection uses binary quantization
+    knowledge_base = Knowledges.get_knowledge_by_id(collection_name)
+    if knowledge_base and knowledge_base.is_binary_quantized:
+        use_binary_quantization = True
+        log.debug(f"Using binary quantization for collection {collection_name}")
+
+    if use_binary_quantization:
+        # Stage 1: Binary search for candidates
+        binary_query = compute_binary_vector(query_embedding)
+        
+        # Calculate candidate limit based on collection size percentage
+        try:
+            collection_info = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+            collection_size = len(collection_info.ids[0]) if collection_info and collection_info.ids and collection_info.ids[0] else 0
+            percentage_candidates = int(collection_size * 0.15)  # 15% of collection
+            multiplier_candidates = k * 10  # 10x multiplier fallback
+            binary_limit = min(max(percentage_candidates, multiplier_candidates, k), 300)  # At least k, max 300
+        except Exception as e:
+            log.debug(f"Could not get collection size for {collection_name}, using fallback: {e}")
+            binary_limit = min(max(k * 10, k), 300)  # Fallback to multiplier approach, at least k
+
+        binary_result = VECTOR_DB_CLIENT.search_binary(
+            collection_name=collection_name,
+            binary_vectors=[binary_query],
+            limit=binary_limit,
+        )
+
+        if binary_result and binary_result.ids and binary_result.ids[0]:
+            # Stage 2: Float search on candidates
+
+            try: 
+                log.debug(f"query_doc:doc {collection_name}")
+                candidate_ids = binary_result.ids[0]
+                result = VECTOR_DB_CLIENT.search_filtered(
+                    collection_name=collection_name,
+                    vectors=[query_embedding],
+                    limit=k,
+                    filtered_ids=candidate_ids,
+                )
+
+                return result
+            
+            except Exception as e:
+                log.exception(f"Error in Stage 2 search for {collection_name}: {e}")
+                # Fall through to regular search fallback
+        else:
+            log.debug("Binary search returned no candidates, falling back to regular search")
+
+    # Regular search fallback (for non-binary collections or failed binary search)
     try:
         log.debug(f"query_doc:doc {collection_name}")
         result = VECTOR_DB_CLIENT.search(
@@ -96,6 +149,7 @@ def query_doc(
     except Exception as e:
         log.exception(f"Error querying doc {collection_name} with limit {k}: {e}")
         raise e
+
 
 
 def get_doc(collection_name: str, user: UserModel = None):
@@ -125,6 +179,60 @@ def query_doc_with_hybrid_search(
 ) -> dict:
     try:
         log.debug(f"query_doc_with_hybrid_search:doc {collection_name}")
+        
+        # Check for binary quantization and pre-filter candidates
+        use_binary_quantization = False
+        knowledge_base = Knowledges.get_knowledge_by_id(collection_name)
+        if knowledge_base and knowledge_base.is_binary_quantized:
+            use_binary_quantization = True
+            log.debug(f"Using binary quantization for hybrid search on collection {collection_name}")
+        
+        if use_binary_quantization:
+            try:
+                # Stage 1: Binary pre-filtering to get candidates
+                query_embedding = embedding_function([query], prefix=RAG_EMBEDDING_QUERY_PREFIX)[0]
+                binary_query = compute_binary_vector(query_embedding)
+                
+                # Calculate candidate limit based on collection size percentage (same logic as query_doc)
+                try:
+                    collection_info = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+                    collection_size = len(collection_info.ids[0]) if collection_info and collection_info.ids and collection_info.ids[0] else 0
+                    percentage_candidates = int(collection_size * 0.15)  # 15% of collection
+                    multiplier_candidates = k * 10  # 10x multiplier fallback
+                    binary_limit = min(max(percentage_candidates, multiplier_candidates, k), 300)  # At least k, max 300
+                except Exception as e:
+                    log.debug(f"Could not get collection size for {collection_name}, using fallback: {e}")
+                    binary_limit = min(max(k * 10, k), 300)  # Fallback to multiplier approach, at least k
+                
+                binary_result = VECTOR_DB_CLIENT.search_binary(
+                    collection_name=collection_name,
+                    binary_vectors=[binary_query],
+                    limit=binary_limit,
+                )
+                
+                if binary_result and binary_result.ids and binary_result.ids[0] and binary_result.documents and binary_result.metadatas:
+                    # Get only the binary-filtered candidates for hybrid search
+                    candidate_ids = binary_result.ids[0]
+                    log.debug(f"Binary search found {len(candidate_ids)} candidates for hybrid search")
+                    
+                    # Get the filtered documents and metadata for BM25
+                    filtered_docs = binary_result.documents[0] if binary_result.documents[0] else []
+                    filtered_metadatas = binary_result.metadatas[0] if binary_result.metadatas[0] else []
+                    
+                    # Create a filtered collection result for hybrid search
+                    collection_result = GetResult(
+                        ids=[candidate_ids],
+                        documents=[filtered_docs], 
+                        metadatas=[filtered_metadatas]
+                    )
+                    log.debug(f"Hybrid search will operate on {len(filtered_docs)} binary-filtered documents")
+                else:
+                    log.debug("Binary search returned no candidates, using full collection for hybrid search")
+            except Exception as e:
+                log.exception(f"Error in binary pre-filtering for hybrid search: {e}")
+                log.debug("Falling back to full collection for hybrid search")
+        
+        # Standard hybrid search logic (now operates on filtered collection_result if binary was used)
         bm25_retriever = BM25Retriever.from_texts(
             texts=collection_result.documents[0],
             metadatas=collection_result.metadatas[0],
@@ -172,7 +280,7 @@ def query_doc_with_hybrid_search(
         if k < k_reranker:
             sorted_items = sorted(
                 zip(distances, metadatas, documents), key=lambda x: x[0], reverse=True
-            )
+)
             sorted_items = sorted_items[:k]
             distances, documents, metadatas = map(list, zip(*sorted_items))
 
@@ -974,3 +1082,20 @@ class RerankCompressor(BaseDocumentCompressor):
             )
             final_results.append(doc)
         return final_results
+
+def compute_binary_vector(vector: list[float]) -> bytes: 
+    """Convert float vector to packed binary (sign-based: positive=1, negative=0)."""
+    vector_array = np.array(vector, dtype=np.float32)
+    # Use sign of values: positive 1, negative/zero 0
+    binary_array = np.where(vector_array > 0, 1, 0).astype(np.uint8)
+
+    # Pad to 8 bits
+    remainder = len(binary_array) % 8
+    if remainder != 0:
+        padding = 8 - remainder
+        binary_array = np.pad(binary_array, (0, padding), mode='constant', constant_values=0)
+
+    # Pack bits into bytes
+    packed = np.packbits(binary_array)
+    return packed.tobytes()
+
