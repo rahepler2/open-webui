@@ -275,7 +275,7 @@ class ChromaClient(VectorDBBase):
             collection = self.client.get_collection(name=collection_name)
             candidate_results = collection.get(ids=filtered_ids, include=["metadatas", "documents", "embeddings"])
             
-            if not candidate_results["embeddings"]:
+            if len(candidate_results["embeddings"]) == 0:
                 return SearchResult(ids=[[]], distances=[[]], documents=[[]], metadatas=[[]]) 
             
             query_vector = np.array(vectors[0])
