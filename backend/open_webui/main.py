@@ -558,11 +558,26 @@ async def lifespan(app: FastAPI):
             ),
             None,
         )
+    
+    # Start binary migration scheduler
+    try:
+        from open_webui.tasks.binary_migration import start_migration_scheduler
+        start_migration_scheduler()
+    except Exception as e:
+        log.warning(f"Failed to start binary migration scheduler: {e}")
 
     yield
 
+    # Cleanup on shutdown
     if hasattr(app.state, "redis_task_command_listener"):
         app.state.redis_task_command_listener.cancel()
+        
+    # Stop binary migration scheduler
+    try:
+        from open_webui.tasks.binary_migration import stop_migration_scheduler
+        stop_migration_scheduler()
+    except Exception as e:
+        log.warning(f"Failed to stop binary migration scheduler: {e}")
 
 
 app = FastAPI(

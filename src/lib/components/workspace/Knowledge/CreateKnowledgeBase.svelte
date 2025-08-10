@@ -120,8 +120,8 @@
 					</div>
 					<button
 						type="button"
-						class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 {isBinaryQuantized
-							? 'bg-blue-600'
+						class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 {isBinaryQuantized
+							? 'bg-green-600'
 							: 'bg-gray-200 dark:bg-gray-700'}"
 						on:click={() => (isBinaryQuantized = !isBinaryQuantized)}
 					>

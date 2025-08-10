@@ -736,15 +736,16 @@
 								{$i18n.t('Binary Quantization')}
 							</span>
 							{#if knowledge?.is_binary_quantized}
-								<span class="px-2 py-0.5 text-xs bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200 rounded-full">
+								<span class="flex items-center gap-1 px-2 py-0.5 text-xs bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 rounded-full">
+									<div class="w-1.5 h-1.5 bg-green-500 rounded-full"></div>
 									{$i18n.t('Enabled')}
 								</span>
 							{/if}
 						</div>
 						<button
 							type="button"
-							class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 {knowledge?.is_binary_quantized
-								? 'bg-blue-600'
+							class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 {knowledge?.is_binary_quantized
+								? 'bg-green-600'
 								: 'bg-gray-200 dark:bg-gray-700'}"
 							on:click={() => {
 								if (knowledge) {

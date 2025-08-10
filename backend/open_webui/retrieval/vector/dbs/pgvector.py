@@ -66,6 +66,7 @@ class DocumentChunk(Base):
     id = Column(Text, primary_key=True)
     vector = Column(Vector(dim=VECTOR_LENGTH), nullable=True)
     collection_name = Column(Text, nullable=False)
+    binary_vector = Column(LargeBinary, nullable=True)
 
     if PGVECTOR_PGCRYPTO:
         text = Column(LargeBinary, nullable=True)
@@ -142,6 +143,14 @@ class PgvectorClient(VectorDBBase):
                     "ON document_chunk (collection_name);"
                 )
             )
+
+            # Setup binary quantization support
+            self.pgvector_version = self._detect_pgvector_version()
+            self.binary_quantization_enabled = self._setup_binary_quantization()
+            
+            # Create migration tracking table
+            self._create_migration_log_table()
+
             self.session.commit()
             log.info("Initialization complete.")
         except Exception as e:
@@ -195,21 +204,470 @@ class PgvectorClient(VectorDBBase):
             vector = vector[:VECTOR_LENGTH]
         return vector
 
+    def _detect_pgvector_version(self) -> str:
+        """Detect pgvector extension version"""
+        try:
+            result = self.session.execute(text(
+                "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+            )).first()
+            return result.extversion if result else '0.0.0'
+        except Exception as e:
+            log.debug(f"Could not detect pgvector version: {e}")
+            return '0.0.0'
+
+    def _setup_binary_quantization(self) -> bool:
+        """Setup binary quantization support based on pgvector version"""
+        try:
+            # Parse version to determine capabilities
+            version_parts = [int(x) for x in self.pgvector_version.split('.')]
+            
+            if version_parts >= [0, 7, 0]:
+                # Native binary quantization with pgvector 0.7.0+
+                log.info(f"pgvector {self.pgvector_version}: Native binary quantization available")
+                return True
+            elif version_parts >= [0, 5, 0]:
+                # Manual binary quantization for pgvector 0.5.0+
+                self._setup_manual_binary_quantization()
+                log.info(f"pgvector {self.pgvector_version}: Manual binary quantization enabled")
+                return True
+            else:
+                log.info(f"pgvector {self.pgvector_version}: Binary quantization not supported")
+                return False
+        except Exception as e:
+            log.warning(f"Binary quantization setup failed: {e}")
+            return False
+
+    def _setup_manual_binary_quantization(self):
+        """Setup manual binary quantization for pgvector < 0.7.0"""
+        try:
+            # Create Hamming distance function if it doesn't exist
+            function_exists = self.session.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_proc 
+                    WHERE proname = 'hamming_distance_fast'
+                )
+            """)).scalar()
+            
+            if not function_exists:
+                # Check PostgreSQL version for bit_count support
+                pg_version = int(self.session.execute(text("SHOW server_version_num")).scalar())
+                
+                if pg_version >= 140000:  # PostgreSQL 14+
+                    hamming_sql = """
+                    CREATE OR REPLACE FUNCTION hamming_distance_fast(a bytea, b bytea) 
+                    RETURNS integer AS $$
+                    DECLARE
+                        xor_bytes bytea;
+                        distance integer := 0;
+                        i integer;
+                    BEGIN
+                        IF a IS NULL OR b IS NULL OR octet_length(a) != octet_length(b) THEN
+                            RETURN 999999;
+                        END IF;
+                        
+                        SELECT a # b INTO xor_bytes;
+                        FOR i IN 0..octet_length(xor_bytes)-1 LOOP
+                            distance := distance + bit_count(get_byte(xor_bytes, i)::bit(8));
+                        END LOOP;
+                        
+                        RETURN distance;
+                    END;
+                    $$ LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE;
+                    """
+                else:  # PostgreSQL < 14
+                    hamming_sql = """
+                    CREATE OR REPLACE FUNCTION hamming_distance_fast(a bytea, b bytea) 
+                    RETURNS integer AS $$
+                    DECLARE
+                        xor_bytes bytea;
+                        distance integer := 0;
+                        byte_val integer;
+                        i integer;
+                    BEGIN
+                        IF a IS NULL OR b IS NULL OR octet_length(a) != octet_length(b) THEN
+                            RETURN 999999;
+                        END IF;
+                        
+                        SELECT a # b INTO xor_bytes;
+                        FOR i IN 0..octet_length(xor_bytes)-1 LOOP
+                            byte_val := get_byte(xor_bytes, i);
+                            WHILE byte_val != 0 LOOP
+                                byte_val := byte_val & (byte_val - 1);
+                                distance := distance + 1;
+                            END LOOP;
+                        END LOOP;
+                        
+                        RETURN distance;
+                    END;
+                    $$ LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE;
+                    """
+                
+                self.session.execute(text(hamming_sql))
+                log.debug("Created Hamming distance function for manual binary quantization")
+        except Exception as e:
+            log.warning(f"Manual binary quantization setup failed: {e}")
+            raise
+
+    def _is_binary_quantized_collection(self, collection_name: str) -> bool:
+        """Check if collection uses binary quantization"""
+        try:
+            result = self.session.execute(text("""
+                SELECT is_binary_quantized 
+                FROM knowledge 
+                WHERE name = :collection_name
+            """), {"collection_name": collection_name}).first()
+            
+            return bool(result and result.is_binary_quantized)
+        except Exception as e:
+            log.debug(f"Could not check binary quantization status for {collection_name}: {e}")
+            return False
+
+    def _detect_migration_candidates(self) -> List[str]:
+        """Detect collections that need automated migration to native binary"""
+        try:
+            version_parts = [int(x) for x in self.pgvector_version.split('.')]
+            if version_parts < [0, 7, 0]:
+                return []
+            
+            # Find binary quantized collections still using manual approach
+            result = self.session.execute(text("""
+                SELECT k.name
+                FROM knowledge k
+                LEFT JOIN document_chunk dc ON dc.collection_name = k.name
+                WHERE k.is_binary_quantized = true
+                  AND COALESCE(k.migration_status, 'manual') = 'manual'
+                  AND EXISTS (
+                      SELECT 1 FROM document_chunk dc2 
+                      WHERE dc2.collection_name = k.name 
+                        AND dc2.binary_vector IS NOT NULL
+                  )
+                LIMIT 1
+            """)).fetchall()
+            
+            return [row.name for row in result]
+            
+        except Exception as e:
+            log.debug(f"Migration candidate detection failed: {e}")
+            return []
+
+    def _is_low_usage_period(self) -> bool:
+        """Determine if current time is suitable for background migration"""
+        from datetime import datetime
+        now = datetime.now()
+        
+        # Consider low usage: 2-6 AM local time and weekends
+        is_night = 2 <= now.hour <= 6
+        is_weekend = now.weekday() >= 5  # Saturday = 5, Sunday = 6
+        
+        return is_night or is_weekend
+
+    def _perform_safe_migration(self, collection_name: str) -> bool:
+        """Perform robust automated migration with safety checks"""
+        migration_id = None
+        try:
+            version_parts = [int(x) for x in self.pgvector_version.split('.')]
+            if version_parts < [0, 7, 0]:
+                return False
+            
+            log.info(f"Starting automated migration for collection: {collection_name}")
+            
+            # Step 1: Pre-migration validation
+            stats = self.session.execute(text("""
+                SELECT 
+                    COUNT(*) as total_vectors,
+                    COUNT(binary_vector) as manual_binary_count
+                FROM document_chunk 
+                WHERE collection_name = :collection_name
+            """), {"collection_name": collection_name}).first()
+            
+            if not stats or stats.manual_binary_count == 0:
+                log.info(f"No manual binary vectors to migrate for {collection_name}")
+                return True
+            
+            # Step 2: Create migration record for tracking
+            from datetime import datetime
+            migration_id = f"migration_{collection_name}_{int(datetime.now().timestamp())}"
+            self.session.execute(text("""
+                INSERT INTO migration_log (id, collection_name, status, started_at, 
+                                         total_vectors, migration_type)
+                VALUES (:id, :collection_name, 'started', NOW(), :total_vectors, 'binary_native')
+                ON CONFLICT (id) DO NOTHING
+            """), {
+                "id": migration_id,
+                "collection_name": collection_name,
+                "total_vectors": stats.total_vectors
+            })
+            
+            # Step 3: Verify data integrity before migration
+            integrity_check = self.session.execute(text("""
+                SELECT COUNT(*) as corrupt_vectors
+                FROM document_chunk 
+                WHERE collection_name = :collection_name
+                  AND (vector IS NULL OR binary_vector IS NULL)
+                  AND id IS NOT NULL
+            """), {"collection_name": collection_name}).scalar()
+            
+            if integrity_check > 0:
+                raise Exception(f"Data integrity issue: {integrity_check} corrupt vectors found")
+            
+            # Step 4: Set migration status
+            self.session.execute(text("""
+                UPDATE knowledge 
+                SET migration_status = 'migrating', 
+                    updated_at = NOW()
+                WHERE name = :collection_name
+            """), {"collection_name": collection_name})
+            
+            # Step 5: Create native binary indexes (non-blocking)
+            log.info(f"Creating native binary indexes for {collection_name}")
+            self._ensure_binary_indexes(collection_name)
+            
+            # Step 6: Test native binary search works
+            test_result = self._validate_native_binary_search(collection_name)
+            if not test_result:
+                raise Exception("Native binary search validation failed")
+            
+            # Step 7: Drop manual binary indexes only after validation
+            log.info(f"Dropping manual binary indexes for {collection_name}")
+            self._drop_manual_binary_indexes(collection_name)
+            
+            # Step 8: Final validation
+            final_check = self.session.execute(text("""
+                SELECT COUNT(*) as total_count
+                FROM document_chunk 
+                WHERE collection_name = :collection_name
+            """), {"collection_name": collection_name}).scalar()
+            
+            if final_check != stats.total_vectors:
+                raise Exception(f"Vector count mismatch: expected {stats.total_vectors}, got {final_check}")
+            
+            # Step 9: Mark migration complete
+            self.session.execute(text("""
+                UPDATE knowledge 
+                SET migration_status = 'native',
+                    updated_at = NOW()
+                WHERE name = :collection_name
+            """), {"collection_name": collection_name})
+            
+            # Step 10: Update migration log
+            self.session.execute(text("""
+                UPDATE migration_log 
+                SET status = 'completed', completed_at = NOW()
+                WHERE id = :migration_id
+            """), {"migration_id": migration_id})
+            
+            self.session.commit()
+            log.info(f"Automated migration completed successfully for {collection_name}")
+            return True
+            
+        except Exception as e:
+            # Robust rollback on any failure
+            try:
+                self.session.rollback()
+                
+                # Reset migration status
+                self.session.execute(text("""
+                    UPDATE knowledge 
+                    SET migration_status = 'manual'
+                    WHERE name = :collection_name
+                """), {"collection_name": collection_name})
+                
+                # Log failure
+                if migration_id:
+                    self.session.execute(text("""
+                        UPDATE migration_log 
+                        SET status = 'failed', completed_at = NOW(), error = :error
+                        WHERE id = :migration_id
+                    """), {"migration_id": migration_id, "error": str(e)})
+                
+                self.session.commit()
+                
+            except Exception as rollback_error:
+                log.error(f"Rollback also failed for {collection_name}: {rollback_error}")
+                
+            log.exception(f"Automated migration failed for {collection_name}: {e}")
+            return False
+
+    def _validate_native_binary_search(self, collection_name: str) -> bool:
+        """Validate that native binary search works correctly"""
+        try:
+            # Get a sample vector for testing
+            sample = self.session.execute(text("""
+                SELECT vector FROM document_chunk 
+                WHERE collection_name = :collection_name 
+                  AND vector IS NOT NULL 
+                LIMIT 1
+            """), {"collection_name": collection_name}).first()
+            
+            if not sample:
+                return True  # No vectors to test
+            
+            # Test native binary search
+            test_result = self._search_native_binary(
+                collection_name, 
+                list(sample.vector), 
+                candidate_limit=10, 
+                final_limit=5
+            )
+            
+            return test_result is not None and len(test_result.ids[0]) >= 0
+            
+        except Exception as e:
+            log.warning(f"Native binary search validation failed: {e}")
+            return False
+
+    def run_automated_migration_check(self):
+        """Main entry point for automated background migration"""
+        if not self._is_low_usage_period():
+            return  # Skip during high usage periods
+        
+        try:
+            candidates = self._detect_migration_candidates()
+            if not candidates:
+                return
+            
+            log.info(f"Found {len(candidates)} collections eligible for automated migration")
+            
+            # Migrate one collection at a time to minimize impact
+            for collection_name in candidates[:1]:  # Only process one per run
+                success = self._perform_safe_migration(collection_name)
+                if success:
+                    log.info(f"Successfully migrated {collection_name} to native binary")
+                else:
+                    log.warning(f"Migration failed for {collection_name}, will retry later")
+                break  # Only do one migration per background run
+                
+        except Exception as e:
+            log.exception(f"Automated migration check failed: {e}")
+
+    def _create_migration_log_table(self):
+        """Create migration tracking table if it doesn't exist"""
+        try:
+            self.session.execute(text("""
+                CREATE TABLE IF NOT EXISTS migration_log (
+                    id VARCHAR(255) PRIMARY KEY,
+                    collection_name VARCHAR(255) NOT NULL,
+                    status VARCHAR(50) NOT NULL,
+                    started_at TIMESTAMP DEFAULT NOW(),
+                    completed_at TIMESTAMP,
+                    total_vectors INTEGER,
+                    migration_type VARCHAR(50),
+                    error TEXT
+                )
+            """))
+            self.session.commit()
+        except Exception as e:
+            log.debug(f"Could not create migration_log table: {e}")
+
+    def _drop_manual_binary_indexes(self, collection_name: str):
+        """Drop manual binary indexes for migrated collection"""
+        try:
+            safe_name = collection_name.replace('-', '_').replace(' ', '_')[:30]
+            index_name = f"idx_binary_manual_{safe_name}"
+            
+            # Check if manual index exists and drop it
+            index_exists = self.session.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_indexes 
+                    WHERE indexname = :index_name
+                )
+            """), {"index_name": index_name}).scalar()
+            
+            if index_exists:
+                self.session.execute(text(f"DROP INDEX IF EXISTS {index_name}"))
+                log.debug(f"Dropped manual binary index: {index_name}")
+                
+        except Exception as e:
+            log.warning(f"Could not drop manual binary indexes for {collection_name}: {e}")
+            # Non-critical error - continue migration
+
+    def _ensure_binary_indexes(self, collection_name: str):
+        """Create binary indexes for collection if they don't exist"""
+        try:
+            # Create safe index name
+            safe_name = collection_name.replace('-', '_').replace(' ', '_')[:30]
+            
+            # Parse version to determine index strategy
+            version_parts = [int(x) for x in self.pgvector_version.split('.')]
+            
+            if version_parts >= [0, 7, 0]:
+                # Native binary index using expression for pgvector 0.7.0+
+                index_name = f"idx_binary_native_{safe_name}"
+                
+                # Check if index exists
+                index_exists = self.session.execute(text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_indexes 
+                        WHERE indexname = :index_name
+                    )
+                """), {"index_name": index_name}).scalar()
+                
+                if not index_exists:
+                    index_sql = f"""
+                    CREATE INDEX {index_name}
+                    ON document_chunk 
+                    USING hnsw ((binary_quantize(vector)::bit({VECTOR_LENGTH})) bit_hamming_ops)
+                    WHERE collection_name = :collection_name
+                    """
+                    
+                    self.session.execute(text(index_sql), {"collection_name": collection_name})
+                    log.debug(f"Created native binary index for collection: {collection_name}")
+                    
+            else:
+                # Manual binary index on bytea column for pgvector 0.5.0+
+                index_name = f"idx_binary_manual_{safe_name}"
+                
+                index_exists = self.session.execute(text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_indexes 
+                        WHERE indexname = :index_name
+                    )
+                """), {"index_name": index_name}).scalar()
+                
+                if not index_exists:
+                    index_sql = f"""
+                    CREATE INDEX {index_name}
+                    ON document_chunk (binary_vector)
+                    WHERE collection_name = :collection_name 
+                      AND binary_vector IS NOT NULL
+                    """
+                    
+                    self.session.execute(text(index_sql), {"collection_name": collection_name})
+                    log.debug(f"Created manual binary index for collection: {collection_name}")
+            
+        except Exception as e:
+            # Non-critical error - index creation might fail due to permissions or other issues
+            log.warning(f"Binary index creation failed for {collection_name}: {e}")
+
     def insert(self, collection_name: str, items: List[VectorItem]) -> None:
         try:
+            # Check if this collection uses binary quantization
+            is_binary_collection = (
+                self.binary_quantization_enabled and 
+                self._is_binary_quantized_collection(collection_name)
+            )
+            
             if PGVECTOR_PGCRYPTO:
                 for item in items:
                     vector = self.adjust_vector_length(item["vector"])
+                    
+                    # Generate binary vector if needed
+                    binary_vector = None
+                    if is_binary_collection:
+                        from open_webui.retrieval.utils import compute_binary_vector
+                        binary_vector = compute_binary_vector(item["vector"])
+                    
                     # Use raw SQL for BYTEA/pgcrypto
                     self.session.execute(
                         text(
                             """
                             INSERT INTO document_chunk
-                            (id, vector, collection_name, text, vmetadata)
+                            (id, vector, collection_name, text, vmetadata, binary_vector)
                             VALUES (
                                 :id, :vector, :collection_name,
                                 pgp_sym_encrypt(:text, :key),
-                                pgp_sym_encrypt(:metadata::text, :key)
+                                pgp_sym_encrypt(:metadata::text, :key),
+                                :binary_vector
                             )
                             ON CONFLICT (id) DO NOTHING
                         """
@@ -221,8 +679,14 @@ class PgvectorClient(VectorDBBase):
                             "text": item["text"],
                             "metadata": json.dumps(item["metadata"]),
                             "key": PGVECTOR_PGCRYPTO_KEY,
+                            "binary_vector": binary_vector,
                         },
                     )
+                
+                # Setup binary indexes for this collection if needed
+                if is_binary_collection:
+                    self._ensure_binary_indexes(collection_name)
+                
                 self.session.commit()
                 log.info(f"Encrypted & inserted {len(items)} into '{collection_name}'")
 
@@ -230,15 +694,29 @@ class PgvectorClient(VectorDBBase):
                 new_items = []
                 for item in items:
                     vector = self.adjust_vector_length(item["vector"])
+                    
+                    # Generate binary vector if needed
+                    binary_vector = None
+                    if is_binary_collection:
+                        from open_webui.retrieval.utils import compute_binary_vector
+                        binary_vector = compute_binary_vector(item["vector"])
+                    
                     new_chunk = DocumentChunk(
                         id=item["id"],
                         vector=vector,
                         collection_name=collection_name,
                         text=item["text"],
                         vmetadata=item["metadata"],
+                        binary_vector=binary_vector,
                     )
                     new_items.append(new_chunk)
+                
                 self.session.bulk_save_objects(new_items)
+                
+                # Setup binary indexes for this collection if needed
+                if is_binary_collection:
+                    self._ensure_binary_indexes(collection_name)
+                
                 self.session.commit()
                 log.info(
                     f"Inserted {len(new_items)} items into collection '{collection_name}'."
@@ -250,24 +728,39 @@ class PgvectorClient(VectorDBBase):
 
     def upsert(self, collection_name: str, items: List[VectorItem]) -> None:
         try:
+            # Check if this collection uses binary quantization
+            is_binary_collection = (
+                self.binary_quantization_enabled and 
+                self._is_binary_quantized_collection(collection_name)
+            )
+            
             if PGVECTOR_PGCRYPTO:
                 for item in items:
                     vector = self.adjust_vector_length(item["vector"])
+                    
+                    # Generate binary vector if needed
+                    binary_vector = None
+                    if is_binary_collection:
+                        from open_webui.retrieval.utils import compute_binary_vector
+                        binary_vector = compute_binary_vector(item["vector"])
+                    
                     self.session.execute(
                         text(
                             """
                             INSERT INTO document_chunk
-                            (id, vector, collection_name, text, vmetadata)
+                            (id, vector, collection_name, text, vmetadata, binary_vector)
                             VALUES (
                                 :id, :vector, :collection_name,
                                 pgp_sym_encrypt(:text, :key),
-                                pgp_sym_encrypt(:metadata::text, :key)
+                                pgp_sym_encrypt(:metadata::text, :key),
+                                :binary_vector
                             )
                             ON CONFLICT (id) DO UPDATE SET
                               vector = EXCLUDED.vector,
                               collection_name = EXCLUDED.collection_name,
                               text = EXCLUDED.text,
-                              vmetadata = EXCLUDED.vmetadata
+                              vmetadata = EXCLUDED.vmetadata,
+                              binary_vector = EXCLUDED.binary_vector
                         """
                         ),
                         {
@@ -277,13 +770,26 @@ class PgvectorClient(VectorDBBase):
                             "text": item["text"],
                             "metadata": json.dumps(item["metadata"]),
                             "key": PGVECTOR_PGCRYPTO_KEY,
+                            "binary_vector": binary_vector,
                         },
                     )
+                
+                # Setup binary indexes for this collection if needed
+                if is_binary_collection:
+                    self._ensure_binary_indexes(collection_name)
+                
                 self.session.commit()
                 log.info(f"Encrypted & upserted {len(items)} into '{collection_name}'")
             else:
                 for item in items:
                     vector = self.adjust_vector_length(item["vector"])
+                    
+                    # Generate binary vector if needed
+                    binary_vector = None
+                    if is_binary_collection:
+                        from open_webui.retrieval.utils import compute_binary_vector
+                        binary_vector = compute_binary_vector(item["vector"])
+                    
                     existing = (
                         self.session.query(DocumentChunk)
                         .filter(DocumentChunk.id == item["id"])
@@ -296,6 +802,7 @@ class PgvectorClient(VectorDBBase):
                         existing.collection_name = (
                             collection_name  # Update collection_name if necessary
                         )
+                        existing.binary_vector = binary_vector
                     else:
                         new_chunk = DocumentChunk(
                             id=item["id"],
@@ -303,8 +810,14 @@ class PgvectorClient(VectorDBBase):
                             collection_name=collection_name,
                             text=item["text"],
                             vmetadata=item["metadata"],
+                            binary_vector=binary_vector,
                         )
                         self.session.add(new_chunk)
+                
+                # Setup binary indexes for this collection if needed
+                if is_binary_collection:
+                    self._ensure_binary_indexes(collection_name)
+                
                 self.session.commit()
                 log.info(
                     f"Upserted {len(items)} items into collection '{collection_name}'."
@@ -320,6 +833,227 @@ class PgvectorClient(VectorDBBase):
         vectors: List[List[float]],
         limit: Optional[int] = None,
     ) -> Optional[SearchResult]:
+        # Check if this collection uses binary quantization
+        is_binary_collection = (
+            self.binary_quantization_enabled and 
+            self._is_binary_quantized_collection(collection_name)
+        )
+        
+        # Try binary search if enabled, with fallback to regular search
+        if is_binary_collection:
+            try:
+                result = self._search_with_binary_quantization(collection_name, vectors, limit)
+                if result:
+                    return result
+                else:
+                    log.warning(f"Binary search returned no results for {collection_name}, falling back to regular search")
+            except Exception as e:
+                log.warning(f"Binary search failed for {collection_name}, falling back to regular search: {e}")
+        
+        # Regular search (existing implementation)
+        return self._search_regular(collection_name, vectors, limit)
+
+    def _search_with_binary_quantization(
+        self, 
+        collection_name: str, 
+        vectors: List[List[float]], 
+        limit: Optional[int] = None
+    ) -> Optional[SearchResult]:
+        """Search using binary quantization with two-stage retrieval"""
+        try:
+            if not vectors:
+                return None
+
+            # Adjust query vector to VECTOR_LENGTH
+            query_vector = self.adjust_vector_length(vectors[0])  # Handle single query
+            candidate_limit = max((limit or 10) * 50, 800)  # Get many candidates for reranking
+            
+            # Determine search strategy based on pgvector version
+            version_parts = [int(x) for x in self.pgvector_version.split('.')]
+            
+            if version_parts >= [0, 7, 0]:
+                # Native binary quantization with pgvector 0.7.0+
+                return self._search_native_binary(collection_name, query_vector, candidate_limit, limit)
+            else:
+                # Manual binary quantization for pgvector 0.5.0+
+                return self._search_manual_binary(collection_name, query_vector, candidate_limit, limit)
+                
+        except Exception as e:
+            log.exception(f"Error during binary search: {e}")
+            return None
+
+    def _search_native_binary(
+        self, 
+        collection_name: str, 
+        query_vector: List[float], 
+        candidate_limit: int, 
+        final_limit: Optional[int]
+    ) -> Optional[SearchResult]:
+        """Search using native pgvector 0.7.0+ binary quantization"""
+        
+        if PGVECTOR_PGCRYPTO:
+            search_sql = f"""
+                SELECT id, text, vmetadata, distance
+                FROM (
+                    SELECT 
+                        id,
+                        pgp_sym_decrypt(text, :key) as text,
+                        pgp_sym_decrypt(vmetadata, :key)::jsonb as vmetadata,
+                        vector <=> :query_vector AS distance
+                    FROM (
+                        SELECT id, text, vmetadata, vector
+                        FROM document_chunk
+                        WHERE collection_name = :collection_name
+                        ORDER BY binary_quantize(vector)::bit({VECTOR_LENGTH}) <~> binary_quantize(:query_vector)
+                        LIMIT :candidate_limit
+                    ) candidates
+                    ORDER BY distance
+                    LIMIT :final_limit
+                ) final
+                ORDER BY distance
+            """
+            
+            params = {
+                "query_vector": query_vector,
+                "collection_name": collection_name,
+                "candidate_limit": candidate_limit,
+                "final_limit": final_limit or 10,
+                "key": PGVECTOR_PGCRYPTO_KEY
+            }
+        else:
+            search_sql = f"""
+                SELECT id, text, vmetadata, distance
+                FROM (
+                    SELECT 
+                        id, text, vmetadata,
+                        vector <=> :query_vector AS distance
+                    FROM (
+                        SELECT id, text, vmetadata, vector
+                        FROM document_chunk
+                        WHERE collection_name = :collection_name
+                        ORDER BY binary_quantize(vector)::bit({VECTOR_LENGTH}) <~> binary_quantize(:query_vector)
+                        LIMIT :candidate_limit
+                    ) candidates
+                    ORDER BY distance
+                    LIMIT :final_limit
+                ) final
+                ORDER BY distance
+            """
+            
+            params = {
+                "query_vector": query_vector,
+                "collection_name": collection_name,
+                "candidate_limit": candidate_limit,
+                "final_limit": final_limit or 10
+            }
+        
+        results = self.session.execute(text(search_sql), params).fetchall()
+        return self._format_binary_search_results(results)
+
+    def _search_manual_binary(
+        self, 
+        collection_name: str, 
+        query_vector: List[float], 
+        candidate_limit: int, 
+        final_limit: Optional[int]
+    ) -> Optional[SearchResult]:
+        """Search using manual binary quantization for pgvector < 0.7.0"""
+        
+        from open_webui.retrieval.utils import compute_binary_vector
+        query_binary = compute_binary_vector(query_vector)
+        
+        if PGVECTOR_PGCRYPTO:
+            search_sql = """
+                SELECT id, text, vmetadata, distance
+                FROM (
+                    SELECT 
+                        id,
+                        pgp_sym_decrypt(text, :key) as text,
+                        pgp_sym_decrypt(vmetadata, :key)::jsonb as vmetadata,
+                        vector <=> :query_vector AS distance
+                    FROM (
+                        SELECT id, text, vmetadata, vector
+                        FROM document_chunk
+                        WHERE collection_name = :collection_name
+                          AND binary_vector IS NOT NULL
+                        ORDER BY hamming_distance_fast(binary_vector, :query_binary)
+                        LIMIT :candidate_limit
+                    ) candidates
+                    ORDER BY distance
+                    LIMIT :final_limit
+                ) final
+                ORDER BY distance
+            """
+            
+            params = {
+                "query_vector": query_vector,
+                "query_binary": query_binary,
+                "collection_name": collection_name,
+                "candidate_limit": candidate_limit,
+                "final_limit": final_limit or 10,
+                "key": PGVECTOR_PGCRYPTO_KEY
+            }
+        else:
+            search_sql = """
+                SELECT id, text, vmetadata, distance
+                FROM (
+                    SELECT 
+                        id, text, vmetadata,
+                        vector <=> :query_vector AS distance
+                    FROM (
+                        SELECT id, text, vmetadata, vector
+                        FROM document_chunk
+                        WHERE collection_name = :collection_name
+                          AND binary_vector IS NOT NULL
+                        ORDER BY hamming_distance_fast(binary_vector, :query_binary)
+                        LIMIT :candidate_limit
+                    ) candidates
+                    ORDER BY distance
+                    LIMIT :final_limit
+                ) final
+                ORDER BY distance
+            """
+            
+            params = {
+                "query_vector": query_vector,
+                "query_binary": query_binary,
+                "collection_name": collection_name,
+                "candidate_limit": candidate_limit,
+                "final_limit": final_limit or 10
+            }
+        
+        results = self.session.execute(text(search_sql), params).fetchall()
+        return self._format_binary_search_results(results)
+
+    def _format_binary_search_results(self, results) -> SearchResult:
+        """Format binary search results to match expected SearchResult format"""
+        
+        ids = [[]]
+        distances = [[]]
+        documents = [[]]
+        metadatas = [[]]
+
+        for row in results:
+            ids[0].append(row.id)
+            # normalize distance to [0, 1] score range (same as regular search)
+            distances[0].append((2.0 - float(row.distance)) / 2.0)
+            documents[0].append(row.text)
+            metadatas[0].append(row.vmetadata)
+
+        return SearchResult(
+            ids=ids,
+            distances=distances,
+            documents=documents,
+            metadatas=metadatas
+        )
+
+    def _search_regular(
+        self,
+        collection_name: str,
+        vectors: List[List[float]],
+        limit: Optional[int] = None,
+    ) -> Optional[SearchResult]:
+        """Regular search without binary quantization (existing implementation)"""
         try:
             if not vectors:
                 return None
@@ -420,7 +1154,7 @@ class PgvectorClient(VectorDBBase):
                 ids=ids, distances=distances, documents=documents, metadatas=metadatas
             )
         except Exception as e:
-            log.exception(f"Error during search: {e}")
+            log.exception(f"Error during regular search: {e}")
             return None
 
     def query(
