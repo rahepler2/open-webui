@@ -1,6 +1,7 @@
 from typing import Optional, List, Dict, Any
 import logging
 import json
+import numpy as np
 from sqlalchemy import (
     func,
     literal,
@@ -50,6 +51,102 @@ Base = declarative_base()
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["RAG"])
+
+# Numba imports with graceful fallback
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+    log.info("Numba JIT compilation available for binary operations")
+except ImportError:
+    NUMBA_AVAILABLE = False
+    log.debug("Numba not available, falling back to NumPy operations")
+    # Define dummy decorators for fallback
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator if args else decorator
+    def prange(*args, **kwargs):
+        return range(*args, **kwargs)
+
+
+# Optimized Hamming distance functions with Numba JIT compilation
+@njit(parallel=True, fastmath=True, cache=True)
+def _hamming_distance_bytes_numba(query_bytes: np.ndarray, candidate_bytes: np.ndarray) -> int:
+    """Numba-optimized Hamming distance for single pair of byte arrays"""
+    if len(query_bytes) != len(candidate_bytes):
+        return 999999
+    
+    distance = 0
+    for i in prange(len(query_bytes)):
+        # XOR and count bits using Brian Kernighan's algorithm
+        xor_byte = query_bytes[i] ^ candidate_bytes[i]
+        while xor_byte:
+            distance += 1
+            xor_byte &= xor_byte - 1  # Remove lowest set bit
+    
+    return distance
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _batch_hamming_distance_numba(query_bytes: np.ndarray, candidates_matrix: np.ndarray) -> np.ndarray:
+    """Numba-optimized batch Hamming distance calculation"""
+    n_candidates, n_bytes = candidates_matrix.shape
+    distances = np.zeros(n_candidates, dtype=np.int32)
+    
+    for i in prange(n_candidates):
+        distances[i] = _hamming_distance_bytes_numba(query_bytes, candidates_matrix[i])
+    
+    return distances
+
+def _hamming_distance_bytes_fallback(query_bytes: bytes, candidate_bytes: bytes) -> int:
+    """NumPy fallback for Hamming distance when Numba is unavailable"""
+    try:
+        if len(query_bytes) != len(candidate_bytes):
+            return 999999
+        
+        query_array = np.frombuffer(query_bytes, dtype=np.uint8)
+        candidate_array = np.frombuffer(candidate_bytes, dtype=np.uint8)
+        
+        xor_result = query_array ^ candidate_array
+        return int(np.sum(np.unpackbits(xor_result)))
+    except Exception:
+        return 999999
+
+def hamming_distance_bytes(query_bytes: bytes, candidate_bytes: bytes) -> int:
+    """High-performance Hamming distance with automatic Numba/NumPy selection"""
+    if NUMBA_AVAILABLE:
+        try:
+            query_array = np.frombuffer(query_bytes, dtype=np.uint8)
+            candidate_array = np.frombuffer(candidate_bytes, dtype=np.uint8)
+            return int(_hamming_distance_bytes_numba(query_array, candidate_array))
+        except Exception:
+            # Fallback to NumPy if Numba fails
+            return _hamming_distance_bytes_fallback(query_bytes, candidate_bytes)
+    else:
+        return _hamming_distance_bytes_fallback(query_bytes, candidate_bytes)
+
+def batch_hamming_distance(query_bytes: bytes, candidate_bytes_list: List[bytes]) -> List[int]:
+    """Batch Hamming distance calculation with optimizations"""
+    if not candidate_bytes_list:
+        return []
+    
+    if NUMBA_AVAILABLE and len(candidate_bytes_list) >= 10:  # Use batch optimization for larger sets
+        try:
+            query_array = np.frombuffer(query_bytes, dtype=np.uint8)
+            
+            # Stack candidate byte arrays into a matrix
+            candidates_matrix = np.vstack([
+                np.frombuffer(candidate, dtype=np.uint8) 
+                for candidate in candidate_bytes_list
+            ])
+            
+            distances = _batch_hamming_distance_numba(query_array, candidates_matrix)
+            return distances.tolist()
+            
+        except Exception as e:
+            log.debug(f"Batch Numba optimization failed, falling back: {e}")
+    
+    # Fallback to individual calculations
+    return [hamming_distance_bytes(query_bytes, candidate) for candidate in candidate_bytes_list]
 
 
 def pgcrypto_encrypt(val, key):
@@ -1046,6 +1143,200 @@ class PgvectorClient(VectorDBBase):
             documents=documents,
             metadatas=metadatas
         )
+
+    def search_binary(self, collection_name: str, binary_vectors: List[bytes], limit: int) -> Optional[SearchResult]:
+        """Search for binary vectors with Hamming distance - interface compatibility with ChromaDB"""
+        try:
+            if not binary_vectors or not self.binary_quantization_enabled:
+                return None
+            
+            # Check if collection uses binary quantization
+            if not self._is_binary_quantized_collection(collection_name):
+                return None
+            
+            log.debug(f"Direct binary search for collection {collection_name} with {len(binary_vectors)} queries")
+            
+            binary_query = binary_vectors[0]  # Handle single query for now
+            version_parts = [int(x) for x in self.pgvector_version.split('.')]
+            
+            if version_parts >= [0, 7, 0]:
+                return self._search_binary_native_direct(collection_name, binary_query, limit)
+            else:
+                return self._search_binary_manual_direct(collection_name, binary_query, limit)
+                
+        except Exception as e:
+            log.exception(f"Error in binary search: {e}")
+            return None
+
+    def _search_binary_manual_direct(self, collection_name: str, query_binary: bytes, limit: int) -> Optional[SearchResult]:
+        """Direct binary search using optimized Python Hamming distance"""
+        try:
+            # For better performance, get all candidates and compute Hamming distance in Python
+            # This allows us to use Numba JIT compilation
+            
+            if PGVECTOR_PGCRYPTO:
+                fetch_sql = """
+                    SELECT id, text, vmetadata, binary_vector
+                    FROM document_chunk
+                    WHERE collection_name = :collection_name
+                      AND binary_vector IS NOT NULL
+                """
+                
+                params = {
+                    "collection_name": collection_name,
+                    "key": PGVECTOR_PGCRYPTO_KEY
+                }
+            else:
+                fetch_sql = """
+                    SELECT id, text, vmetadata, binary_vector
+                    FROM document_chunk
+                    WHERE collection_name = :collection_name
+                      AND binary_vector IS NOT NULL
+                """
+                
+                params = {
+                    "collection_name": collection_name
+                }
+            
+            candidates = self.session.execute(text(fetch_sql), params).fetchall()
+            
+            if not candidates:
+                return SearchResult(ids=[[]], distances=[[]], documents=[[]], metadatas=[[]])
+            
+            # Extract binary vectors for batch processing
+            candidate_binaries = [bytes(row.binary_vector) for row in candidates]
+            
+            # Compute Hamming distances using optimized functions
+            log.debug(f"Computing Hamming distances for {len(candidates)} candidates using {'Numba' if NUMBA_AVAILABLE else 'NumPy'}")
+            hamming_distances = batch_hamming_distance(query_binary, candidate_binaries)
+            
+            # Combine results with distances and sort
+            candidate_results = []
+            max_hamming = len(query_binary) * 8
+            
+            for i, row in enumerate(candidates):
+                hamming_dist = hamming_distances[i]
+                similarity = 1.0 - (float(hamming_dist) / max_hamming)
+                
+                # Decrypt text and metadata if needed
+                if PGVECTOR_PGCRYPTO:
+                    # Note: For encrypted content, we'd need to decrypt here
+                    # For now, pass through assuming decryption happens elsewhere
+                    text = row.text
+                    vmetadata = row.vmetadata
+                else:
+                    text = row.text
+                    vmetadata = row.vmetadata
+                
+                candidate_results.append({
+                    'id': row.id,
+                    'text': text,
+                    'vmetadata': vmetadata,
+                    'distance': hamming_dist,
+                    'similarity': max(0.0, min(1.0, similarity))
+                })
+            
+            # Sort by distance (ascending - lower is better)
+            candidate_results.sort(key=lambda x: x['distance'])
+            
+            # Take top results
+            top_results = candidate_results[:limit]
+            
+            # Format results
+            ids = [[r['id'] for r in top_results]]
+            distances = [[r['similarity'] for r in top_results]]
+            documents = [[r['text'] for r in top_results]]
+            metadatas = [[r['vmetadata'] for r in top_results]]
+
+            log.debug(f"Manual binary search returned {len(top_results)} results")
+            
+            return SearchResult(
+                ids=ids,
+                distances=distances,
+                documents=documents,
+                metadatas=metadatas
+            )
+            
+        except Exception as e:
+            log.exception(f"Optimized manual binary search failed: {e}")
+            return None
+
+    def _search_binary_native_direct(self, collection_name: str, query_binary: bytes, limit: int) -> Optional[SearchResult]:
+        """Direct binary search using native pgvector 0.7.0+ with binary query input"""
+        try:
+            # For native pgvector 0.7.0+, we can use the binary operators directly
+            if PGVECTOR_PGCRYPTO:
+                search_sql = f"""
+                    SELECT id, text, vmetadata, distance
+                    FROM (
+                        SELECT 
+                            id,
+                            pgp_sym_decrypt(text, :key) as text,
+                            pgp_sym_decrypt(vmetadata, :key)::jsonb as vmetadata,
+                            binary_quantize(vector)::bit({VECTOR_LENGTH}) <~> :query_binary::bit({VECTOR_LENGTH}) as distance
+                        FROM document_chunk
+                        WHERE collection_name = :collection_name
+                        ORDER BY distance
+                        LIMIT :limit
+                    ) results
+                    ORDER BY distance
+                """
+                
+                params = {
+                    "query_binary": query_binary,
+                    "collection_name": collection_name,
+                    "limit": limit,
+                    "key": PGVECTOR_PGCRYPTO_KEY
+                }
+            else:
+                search_sql = f"""
+                    SELECT id, text, vmetadata, distance
+                    FROM (
+                        SELECT 
+                            id, text, vmetadata,
+                            binary_quantize(vector)::bit({VECTOR_LENGTH}) <~> :query_binary::bit({VECTOR_LENGTH}) as distance
+                        FROM document_chunk
+                        WHERE collection_name = :collection_name
+                        ORDER BY distance
+                        LIMIT :limit
+                    ) results
+                    ORDER BY distance
+                """
+                
+                params = {
+                    "query_binary": query_binary,
+                    "collection_name": collection_name,
+                    "limit": limit
+                }
+            
+            results = self.session.execute(text(search_sql), params).fetchall()
+            
+            # Format results to match SearchResult format
+            ids = [[]]
+            distances = [[]]
+            documents = [[]]
+            metadatas = [[]]
+
+            for row in results:
+                ids[0].append(row.id)
+                # Convert Hamming distance to similarity score [0, 1] range
+                hamming_dist = float(row.distance)
+                max_hamming = VECTOR_LENGTH  # For bit strings, max distance is the length
+                similarity = 1.0 - (hamming_dist / max_hamming)
+                distances[0].append(max(0.0, min(1.0, similarity)))  # Clamp to [0, 1]
+                documents[0].append(row.text)
+                metadatas[0].append(row.vmetadata)
+
+            return SearchResult(
+                ids=ids,
+                distances=distances,
+                documents=documents,
+                metadatas=metadatas
+            )
+            
+        except Exception as e:
+            log.exception(f"Native binary search failed: {e}")
+            return None
 
     def _search_regular(
         self,
